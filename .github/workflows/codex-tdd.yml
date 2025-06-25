@@ -1,0 +1,261 @@
+name: Test-Driven Development (TDD) Workflow
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+
+jobs:
+  tdd-test-suite:
+    runs-on: ubuntu-latest
+    name: TDD Test Suite
+    
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
+        
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-${{ matrix.python-version }}-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-mock pytest-asyncio
+        pip install black flake8 mypy bandit
+        
+    - name: Run unit tests
+      run: |
+        pytest tests/unit/ -v --cov=main --cov-report=xml --cov-report=html
+        
+    - name: Run integration tests
+      run: |
+        pytest tests/integration/ -v --cov=main --cov-report=xml --cov-report=html
+        
+    - name: Run API tests
+      run: |
+        pytest tests/api/ -v --cov=main --cov-report=xml --cov-report=html
+        
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: coverage-reports-${{ matrix.python-version }}
+        path: htmlcov/
+        
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+
+  tdd-code-quality:
+    runs-on: ubuntu-latest
+    name: Code Quality Checks
+    needs: tdd-test-suite
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        pip install black flake8 mypy bandit
+        
+    - name: Check code formatting
+      run: |
+        black --check --diff .
+        
+    - name: Run linter
+      run: |
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+        
+    - name: Type checking
+      run: |
+        mypy main.py --ignore-missing-imports --strict
+        
+    - name: Security scan
+      run: |
+        bandit -r . -f json -o bandit-report.json
+        
+    - name: Upload security report
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-report
+        path: bandit-report.json
+
+  tdd-performance:
+    runs-on: ubuntu-latest
+    name: Performance Testing
+    needs: tdd-test-suite
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install locust pytest-benchmark
+        
+    - name: Run performance tests
+      run: |
+        pytest tests/performance/ -v --benchmark-only
+        
+    - name: Run load tests
+      run: |
+        locust -f tests/load/locustfile.py --headless --users 10 --spawn-rate 1 --run-time 60s
+        
+    - name: Upload performance reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-reports
+        path: |
+          .pytest_cache/
+          *.csv
+
+  tdd-database:
+    runs-on: ubuntu-latest
+    name: Database Tests
+    needs: tdd-test-suite
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install pytest-postgresql
+        
+    - name: Run database tests
+      env:
+        DB_HOST: localhost
+        DB_NAME: test_db
+        DB_USER: postgres
+        DB_PASS: postgres
+        DB_PORT: 5432
+      run: |
+        pytest tests/database/ -v
+
+  tdd-notification:
+    runs-on: ubuntu-latest
+    name: Test Results Notification
+    needs: [tdd-test-suite, tdd-code-quality, tdd-performance, tdd-database]
+    if: always()
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Notify on failure
+      if: failure()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { data: comments } = await github.rest.issues.listComments({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+          });
+          
+          const botComment = comments.find(comment => 
+            comment.user.type === 'Bot' && 
+            comment.body.includes('TDD Test Results')
+          );
+          
+          const message = `## TDD Test Results ❌
+          
+          Some tests have failed. Please check the workflow logs for details.
+          
+          - Unit Tests: ${{ needs.tdd-test-suite.result }}
+          - Code Quality: ${{ needs.tdd-code-quality.result }}
+          - Performance Tests: ${{ needs.tdd-performance.result }}
+          - Database Tests: ${{ needs.tdd-database.result }}
+          
+          Please fix the failing tests before merging.`;
+          
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              comment_id: botComment.id,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: message
+            });
+          } else {
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: message
+            });
+          }
+          
+    - name: Notify on success
+      if: success()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const message = `## TDD Test Results ✅
+          
+          All tests have passed successfully!
+          
+          - Unit Tests: ✅
+          - Code Quality: ✅
+          - Performance Tests: ✅
+          - Database Tests: ✅
+          
+          Ready for review and merge.`;
+          
+          await github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: message
+          }); 

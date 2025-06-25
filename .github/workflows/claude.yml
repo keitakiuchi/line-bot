@@ -1,0 +1,153 @@
+name: Claude AI Integration
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    name: Claude Code Review
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov black flake8 mypy
+        
+    - name: Code formatting check
+      run: |
+        black --check --diff .
+        
+    - name: Lint with flake8
+      run: |
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+        
+    - name: Type checking with mypy
+      run: |
+        mypy main.py --ignore-missing-imports
+        
+    - name: Run tests
+      run: |
+        pytest --cov=. --cov-report=xml
+        
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+
+  claude-analysis:
+    runs-on: ubuntu-latest
+    name: Claude AI Analysis
+    needs: claude-review
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Claude AI Analysis
+      uses: anthropics-ai/claude-action@v1
+      with:
+        prompt: |
+          Please analyze the code changes in this pull request and provide:
+          1. Code quality assessment
+          2. Security considerations
+          3. Performance implications
+          4. Suggestions for improvement
+          5. Compliance with project coding standards
+        api-key: ${{ secrets.CLAUDE_API_KEY }}
+        
+    - name: Comment on PR
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request'
+      with:
+        script: |
+          const fs = require('fs');
+          const analysis = fs.readFileSync('claude-analysis.txt', 'utf8');
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `## Claude AI Analysis\n\n${analysis}`
+          });
+
+  security-scan:
+    runs-on: ubuntu-latest
+    name: Security Scan
+    needs: claude-review
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Bandit security scan
+      run: |
+        pip install bandit
+        bandit -r . -f json -o bandit-report.json
+        
+    - name: Upload security scan results
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-scan-results
+        path: bandit-report.json
+
+  deployment-check:
+    runs-on: ubuntu-latest
+    name: Deployment Readiness Check
+    needs: [claude-review, claude-analysis, security-scan]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Validate environment variables
+      run: |
+        python -c "
+        import os
+        required_vars = [
+            'YOUR_CHANNEL_ACCESS_TOKEN',
+            'YOUR_CHANNEL_SECRET',
+            'OPENAI_API_KEY',
+            'STRIPE_SECRET_KEY',
+            'SUBSCRIPTION_PRICE_ID',
+            'DB_HOST',
+            'DB_NAME',
+            'DB_USER',
+            'DB_PASS'
+        ]
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if missing_vars:
+            print(f'Missing environment variables: {missing_vars}')
+            exit(1)
+        print('All required environment variables are set')
+        "
+      env:
+        YOUR_CHANNEL_ACCESS_TOKEN: ${{ secrets.YOUR_CHANNEL_ACCESS_TOKEN }}
+        YOUR_CHANNEL_SECRET: ${{ secrets.YOUR_CHANNEL_SECRET }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+        SUBSCRIPTION_PRICE_ID: ${{ secrets.SUBSCRIPTION_PRICE_ID }}
+        DB_HOST: ${{ secrets.DB_HOST }}
+        DB_NAME: ${{ secrets.DB_NAME }}
+        DB_USER: ${{ secrets.DB_USER }}
+        DB_PASS: ${{ secrets.DB_PASS }}
+        
+    - name: Deploy to staging
+      run: |
+        echo "Deployment check passed. Ready for production deployment." 

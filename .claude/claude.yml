@@ -1,0 +1,39 @@
+# Claude AI Configuration
+# This file contains configuration settings for Claude AI integration
+
+# Claude API Configuration
+claude:
+  model: claude-3-5-sonnet-20241022
+  max_tokens: 4096
+  temperature: 0.7
+  
+# Project-specific settings
+project:
+  name: "LINE Bot カウンセリングアプリケーション"
+  description: "AI-powered counseling application using LINE Bot and GPT-4"
+  language: "Japanese"
+  
+# Development settings
+development:
+  debug: true
+  log_level: "INFO"
+  
+# AI Behavior Configuration
+ai_behavior:
+  system_prompt: |
+    You are a supportive, Japanese-speaking counselor using the Listen-Back method.
+    Follow the structured counseling approach with Listen-Back 1, Listen-Back 2, and questions.
+    Maintain a warm, empathetic tone while providing professional guidance.
+  
+# Integration settings
+integrations:
+  line_bot: true
+  openai: true
+  stripe: true
+  postgresql: true
+  
+# Security settings
+security:
+  api_key_rotation: true
+  rate_limiting: true
+  input_validation: true 
