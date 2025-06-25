@@ -15,7 +15,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__) # stripeの情報の確認
 import stripe
 import psycopg2
+from psycopg2 import pool
 import datetime
+import re
 
 app = Flask(__name__)
 
@@ -31,20 +33,52 @@ GPT4_API_URL = 'https://api.openai.com/v1/chat/completions'
 stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["SUBSCRIPTION_PRICE_ID"]
 
-# db接続
+# オーナー（管理者）のLINE ID（環境変数から取得、設定されていない場合はNone）
+OWNER_LINE_ID = os.environ.get("OWNER_LINE_ID")
+
+# データベース接続プール
+connection_pool = None
+
+def init_connection_pool():
+    global connection_pool
+    try:
+        database_url = os.environ.get('DATABASE_URL')
+        if database_url:
+            connection_pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=20,
+                dsn=database_url
+            )
+        else:
+            dsn = f"host={os.environ['DB_HOST']} " \
+                  f"port=5432 " \
+                  f"dbname={os.environ['DB_NAME']} " \
+                  f"user={os.environ['DB_USER']} " \
+                  f"password={os.environ['DB_PASS']}"
+            connection_pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=20,
+                dsn=dsn
+            )
+        logger.info("Database connection pool initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize connection pool: {e}")
+        raise
+
 def get_connection():
-    # HerokuではDATABASE_URL環境変数を使用
-    database_url = os.environ.get('DATABASE_URL')
-    if database_url:
-        return psycopg2.connect(database_url)
-    else:
-        # フォールバック: 個別の環境変数を使用
-        dsn = f"host={os.environ['DB_HOST']} " \
-              f"port=5432 " \
-              f"dbname={os.environ['DB_NAME']} " \
-              f"user={os.environ['DB_USER']} " \
-              f"password={os.environ['DB_PASS']}"
-        return psycopg2.connect(dsn)
+    global connection_pool
+    if connection_pool is None:
+        init_connection_pool()
+    try:
+        return connection_pool.getconn()
+    except Exception as e:
+        logger.error(f"Failed to get connection from pool: {e}")
+        raise
+
+def put_connection(connection):
+    global connection_pool
+    if connection_pool and connection:
+        connection_pool.putconn(connection)
 
 @app.route("/")
 def hello_world():
@@ -60,6 +94,34 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return 'OK'
+
+# 入力検証関数
+def validate_message(message):
+    if not message or not isinstance(message, str):
+        raise ValueError("Invalid message format")
+    
+    # メッセージ長制限
+    if len(message) > 2000:
+        raise ValueError("Message too long")
+    
+    # 空文字やスペースのみのチェック
+    if not message.strip():
+        raise ValueError("Empty message")
+    
+    # 危険な文字列パターンのチェック
+    dangerous_patterns = [
+        r'<script.*?>.*?</script>',  # XSS
+        r'javascript:',  # JavaScript injection
+        r'vbscript:',   # VBScript injection
+        r'data:text/html',  # Data URI XSS
+    ]
+    
+    message_lower = message.lower()
+    for pattern in dangerous_patterns:
+        if re.search(pattern, message_lower, re.IGNORECASE | re.DOTALL):
+            raise ValueError("Potentially dangerous content detected")
+    
+    return message.strip()
 
 sys_prompt = "You will be playing the role of a supportive, Japanese-speaking counselor. Here is the conversation history so far:\n\n<conversation_history>\n{{CONVERSATION_HISTORY}}\n</conversation_history>\n\nThe user has just said:\n<user_statement>\n{{QUESTION}}\n</user_statement>\n\nPlease carefully review the conversation history and the user's latest statement. Your goal is to provide supportive counseling while following this specific method:\n\n1. Listen-Back 1: After the user makes a statement, paraphrase it into a single sentence while adding a new nuance or interpretation. \n2. Wait for the user's reply to your Listen-Back 1.\n3. Listen-Back 2: After receiving the user's response, further paraphrase their reply, condensing it into one sentence and adding another layer of meaning or interpretation.\n4. Once you've done Listen-Back 1 and Listen-Back 2 and received a response from the user, you may then pose a question from the list below, in the specified order. Do not ask a question out of order.\n5. After the user answers your question, return to Listen-Back 1 - paraphrase their answer in one sentence and introduce a new nuance or interpretation. \n6. You can ask your next question only after receiving a response to your Listen-Back 1, providing your Listen-Back 2, and getting another response from the user.\n\nIn essence, never ask consecutive questions. Always follow the pattern of Listen-Back 1, user response, Listen-Back 2, another user response before moving on to the next question.\n\nHere is the order in which you should ask questions:\n1. Start by asking the user about something they find particularly troubling.\n2. Then, inquire about how they'd envision the ideal outcome. \n3. Proceed by asking about what little they've already done.\n4. Follow up by exploring other actions they're currently undertaking.\n5. Delve into potential resources that could aid in achieving their goals.\n6. Discuss the immediate actions they can take to move closer to their aspirations.\n7. Lastly, encourage them to complete the very first step in that direction with some positive feedback, and ask if you can close the conversation.\n\n<example>\nUser: I'm so busy I don't even have time to sleep.\nYou: You are having trouble getting enough sleep.\nUser: Yes.\nYou: You are so busy that you want to manage to get some sleep.\nUser: Yes.\nYou: In what way do you have problems when you get less sleep?\n</example>\n\n<example>  \nUser: I get sick when I get less sleep.\nYou: You are worried about getting sick.\nUser: Yes.\nYou: You feel that sleep time is important to stay healthy.\nUser: That is right.\nYou: What do you hope to become?\n</example>\n\n<example>\nUser: I want to be free from suffering. But I cannot relinquish responsibility.\nYou: You want to be free from suffering, but at the same time you can't give up your responsibility.\nUser: Exactly.\nYou: You are searching for your own way forward.\nUser: Maybe so.\nYou: When do you think you are getting closer to the path you should be on, even if only a little?  \n</example>\n\nPlease follow the above procedures strictly for the consultation."
 
@@ -98,6 +160,7 @@ def generate_gpt4_response(prompt, userId):
         
 def get_system_responses_in_last_24_hours(userId):
     # この関数の中でデータベースにアクセスして、指定されたユーザーに対する過去24時間以内のシステムの応答数を取得します。
+    connection = None
     try:
         connection = get_connection()
         cursor = connection.cursor()
@@ -114,12 +177,15 @@ def get_system_responses_in_last_24_hours(userId):
             return 0
         finally:
             cursor.close()
-            connection.close()
     except Exception as e:
         logger.error(f"Connection error in get_system_responses_in_last_24_hours: {e}")
         return 0
+    finally:
+        if connection:
+            put_connection(connection)
 
 def deactivate_conversation_history(userId):
+    connection = None
     try:
         connection = get_connection()
         cursor = connection.cursor()
@@ -135,44 +201,63 @@ def deactivate_conversation_history(userId):
             connection.rollback()
         finally:
             cursor.close()
-            connection.close()
     except Exception as e:
         logger.error(f"Connection error in deactivate_conversation_history: {e}")
         # データベース接続エラーでもアプリケーションを継続
         pass
+    finally:
+        if connection:
+            put_connection(connection)
 
 # LINEからのメッセージを処理し、必要に応じてStripeの情報も確認します。
 @handler.add(MessageEvent, message=TextMessage)
 def handle_line_message(event):
     userId = getattr(event.source, 'user_id', None)
 
-    if event.message.text == "スタート" and userId:
-        deactivate_conversation_history(userId)
-        reply_text = "頼りにしてくださりありがとうございます。今日はどんなお話をうかがいましょうか？"
-    else:
-        # 現在のタイムスタンプを取得
-        current_timestamp = datetime.datetime.now()
-
-        if userId:
-            subscription_details = get_subscription_details_for_user(userId, STRIPE_PRICE_ID)
-            stripe_id = subscription_details['stripeId'] if subscription_details else None
-            subscription_status = subscription_details['status'] if subscription_details else None
-
-            log_to_database(current_timestamp, 'user', userId, stripe_id, event.message.text, True, sys_prompt)  # is_activeをTrueで保存
-
-            if subscription_status == "active": ####################本番はactive################
-                reply_text = generate_gpt4_response(event.message.text, userId)
-            else:
-                response_count = get_system_responses_in_last_24_hours(userId)
-                if response_count < 5: 
-                    reply_text = generate_gpt4_response(event.message.text, userId)
-                else:
-                    reply_text = "利用回数の上限に達しました。24時間後に再度お試しください。こちらから回数無制限の有料プランに申し込むこともできます：https://line-login-3fbeac7c6978.herokuapp.com/"
+    try:
+        # 入力検証
+        validated_message = validate_message(event.message.text)
+        
+        if validated_message == "スタート" and userId:
+            deactivate_conversation_history(userId)
+            reply_text = "頼りにしてくださりありがとうございます。今日はどんなお話をうかがいましょうか？"
         else:
-            reply_text = "エラーが発生しました。"
+            # 現在のタイムスタンプを取得
+            current_timestamp = datetime.datetime.now()
 
-        # メッセージをログに保存
-        log_to_database(current_timestamp, 'system', userId, stripe_id, reply_text, True, sys_prompt)  # is_activeをTrueで保存
+            if userId:
+                subscription_details = get_subscription_details_for_user(userId, STRIPE_PRICE_ID)
+                stripe_id = subscription_details['stripeId'] if subscription_details else None
+                subscription_status = subscription_details['status'] if subscription_details else None
+
+                log_to_database(current_timestamp, 'user', userId, stripe_id, validated_message, True, sys_prompt)  # is_activeをTrueで保存
+
+                # オーナーIDの場合は無制限で利用可能
+                if userId == OWNER_LINE_ID:
+                    reply_text = generate_gpt4_response(validated_message, userId)
+                elif subscription_status == "active": ####################本番はactive################
+                    reply_text = generate_gpt4_response(validated_message, userId)
+                else:
+                    # オーナーIDでない場合のみ24時間制限をチェック
+                    response_count = get_system_responses_in_last_24_hours(userId)
+                    if response_count < 5: 
+                        reply_text = generate_gpt4_response(validated_message, userId)
+                    else:
+                        reply_text = "利用回数の上限に達しました。24時間後に再度お試しください。こちらから回数無制限の有料プランに申し込むこともできます：https://line-login-3fbeac7c6978.herokuapp.com/"
+            else:
+                reply_text = "エラーが発生しました。"
+
+            # メッセージをログに保存
+            log_to_database(current_timestamp, 'system', userId, stripe_id, reply_text, True, sys_prompt)  # is_activeをTrueで保存
+
+    except ValueError as e:
+        # 入力検証エラーの場合
+        logger.warning(f"Invalid input from user {userId}: {e}")
+        reply_text = "申し訳ございませんが、メッセージの形式に問題があります。もう一度お試しください。"
+    except Exception as e:
+        # その他のエラー
+        logger.error(f"Unexpected error in handle_line_message: {e}")
+        reply_text = "申し訳ございません。一時的なエラーが発生しました。しばらくしてから再度お試しください。"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
@@ -193,6 +278,7 @@ def check_subscription_status(userId):
 
 # データをdbに入れる関数
 def log_to_database(timestamp, sender, userId, stripeId, message, is_active=True, sys_prompt=''):
+    connection = None
     try:
         connection = get_connection()
         cursor = connection.cursor()
@@ -208,15 +294,18 @@ def log_to_database(timestamp, sender, userId, stripeId, message, is_active=True
             connection.rollback()
         finally:
             cursor.close()
-            connection.close()
     except Exception as e:
         logger.error(f"Connection error in log_to_database: {e}")
         # データベース接続エラーでもアプリケーションを継続
         pass
+    finally:
+        if connection:
+            put_connection(connection)
 
 # 会話履歴を参照する関数
 def get_conversation_history(userId):
     conversations = []
+    connection = None
     try:
         connection = get_connection()
         cursor = connection.cursor()
@@ -236,9 +325,11 @@ def get_conversation_history(userId):
             logger.error(f"Database error in get_conversation_history: {e}")
         finally:
             cursor.close()
-            connection.close()
     except Exception as e:
         logger.error(f"Connection error in get_conversation_history: {e}")
+    finally:
+        if connection:
+            put_connection(connection)
 
     # 最新の会話が最後に来るように反転
     return conversations[::-1]
