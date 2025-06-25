@@ -109,6 +109,9 @@ def callback():
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
+    except Exception as e:
+        logger.error(f"Callback error: {e}")
+        return 'ERROR', 500
     return 'OK'
 
 sys_prompt = "You will be playing the role of a supportive, Japanese-speaking counselor. Here is the conversation history so far:\n\n<conversation_history>\n{{CONVERSATION_HISTORY}}\n</conversation_history>\n\nThe user has just said:\n<user_statement>\n{{QUESTION}}\n</user_statement>\n\nPlease carefully review the conversation history and the user's latest statement. Your goal is to provide supportive counseling while following this specific method:\n\n1. Listen-Back 1: After the user makes a statement, paraphrase it into a single sentence while adding a new nuance or interpretation. \n2. Wait for the user's reply to your Listen-Back 1.\n3. Listen-Back 2: After receiving the user's response, further paraphrase their reply, condensing it into one sentence and adding another layer of meaning or interpretation.\n4. Once you've done Listen-Back 1 and Listen-Back 2 and received a response from the user, you may then pose a question from the list below, in the specified order. Do not ask a question out of order.\n5. After the user answers your question, return to Listen-Back 1 - paraphrase their answer in one sentence and introduce a new nuance or interpretation. \n6. You can ask your next question only after receiving a response to your Listen-Back 1, providing your Listen-Back 2, and getting another response from the user.\n\nIn essence, never ask consecutive questions. Always follow the pattern of Listen-Back 1, user response, Listen-Back 2, another user response before moving on to the next question.\n\nHere is the order in which you should ask questions:\n1. Start by asking the user about something they find particularly troubling.\n2. Then, inquire about how they'd envision the ideal outcome. \n3. Proceed by asking about what little they've already done.\n4. Follow up by exploring other actions they're currently undertaking.\n5. Delve into potential resources that could aid in achieving their goals.\n6. Discuss the immediate actions they can take to move closer to their aspirations.\n7. Lastly, encourage them to complete the very first step in that direction with some positive feedback, and ask if you can close the conversation.\n\n<example>\nUser: I'm so busy I don't even have time to sleep.\nYou: You are having trouble getting enough sleep.\nUser: Yes.\nYou: You are so busy that you want to manage to get some sleep.\nUser: Yes.\nYou: In what way do you have problems when you get less sleep?\n</example>\n\n<example>  \nUser: I get sick when I get less sleep.\nYou: You are worried about getting sick.\nUser: Yes.\nYou: You feel that sleep time is important to stay healthy.\nUser: That is right.\nYou: What do you hope to become?\n</example>\n\n<example>\nUser: I want to be free from suffering. But I cannot relinquish responsibility.\nYou: You want to be free from suffering, but at the same time you can't give up your responsibility.\nUser: Exactly.\nYou: You are searching for your own way forward.\nUser: Maybe so.\nYou: When do you think you are getting closer to the path you should be on, even if only a little?  \n</example>\n\nPlease follow the above procedures strictly for the consultation."
@@ -116,7 +119,7 @@ sys_prompt = "You will be playing the role of a supportive, Japanese-speaking co
 def generate_gpt4_response(prompt, userId):
     """OpenAI APIを使用してGPT-4応答を生成（最新ライブラリ使用）"""
     try:
-        # 過去の会話履歴を取得（最新5件に制限）
+        # 過去の会話履歴を取得（最新3件に制限）
         conversation_history = get_conversation_history(userId)
         
         # メッセージリストを構築
@@ -136,8 +139,8 @@ def generate_gpt4_response(prompt, userId):
             model="gpt-4o-mini",  # より軽量で高速なモデル
             messages=messages,
             temperature=1.0,
-            max_tokens=300,  # さらに短縮
-            timeout=20.0  # タイムアウトを短縮
+            max_tokens=200,  # さらに短縮
+            timeout=8.0  # タイムアウトを大幅短縮
         )
         
         return response.choices[0].message.content.strip()
@@ -237,7 +240,7 @@ def get_subscription_details_for_user(userId, STRIPE_PRICE_ID):
     try:
         # より効率的なクエリ（limitを削減）
         subscriptions = stripe.Subscription.list(
-            limit=50,  # 100から50に削減
+            limit=20,  # 50から20に削減
             status='active',
             expand=['data.items.data.price']
         )
@@ -281,7 +284,7 @@ def get_conversation_history(userId):
             query = """
             SELECT sender, message FROM line_bot_logs 
             WHERE lineId=%s AND is_active=TRUE 
-            ORDER BY timestamp DESC LIMIT 5;
+            ORDER BY timestamp DESC LIMIT 3;
             """
             cursor.execute(query, (userId,))
             
