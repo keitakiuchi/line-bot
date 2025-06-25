@@ -33,12 +33,18 @@ STRIPE_PRICE_ID = os.environ["SUBSCRIPTION_PRICE_ID"]
 
 # db接続
 def get_connection():
-    dsn = f"host={os.environ['DB_HOST']} " \
-          f"port=5432 " \
-          f"dbname={os.environ['DB_NAME']} " \
-          f"user={os.environ['DB_USER']} " \
-          f"password={os.environ['DB_PASS']}"
-    return psycopg2.connect(dsn)
+    # HerokuではDATABASE_URL環境変数を使用
+    database_url = os.environ.get('DATABASE_URL')
+    if database_url:
+        return psycopg2.connect(database_url)
+    else:
+        # フォールバック: 個別の環境変数を使用
+        dsn = f"host={os.environ['DB_HOST']} " \
+              f"port=5432 " \
+              f"dbname={os.environ['DB_NAME']} " \
+              f"user={os.environ['DB_USER']} " \
+              f"password={os.environ['DB_PASS']}"
+        return psycopg2.connect(dsn)
 
 @app.route("/")
 def hello_world():
@@ -92,40 +98,48 @@ def generate_gpt4_response(prompt, userId):
         
 def get_system_responses_in_last_24_hours(userId):
     # この関数の中でデータベースにアクセスして、指定されたユーザーに対する過去24時間以内のシステムの応答数を取得します。
-    # 以下は仮の実装の例です。
-    connection = get_connection()
-    cursor = connection.cursor()
     try:
-        query = """
-        SELECT COUNT(*) FROM line_bot_logs 
-        WHERE sender='system' AND lineId=%s AND timestamp > NOW() - INTERVAL '24 HOURS';
-        """
-        cursor.execute(query, (userId,))
-        result = cursor.fetchone()
-        return result[0]
+        connection = get_connection()
+        cursor = connection.cursor()
+        try:
+            query = """
+            SELECT COUNT(*) FROM line_bot_logs 
+            WHERE sender='system' AND lineId=%s AND timestamp > NOW() - INTERVAL '24 HOURS';
+            """
+            cursor.execute(query, (userId,))
+            result = cursor.fetchone()
+            return result[0]
+        except Exception as e:
+            logger.error(f"Database error in get_system_responses_in_last_24_hours: {e}")
+            return 0
+        finally:
+            cursor.close()
+            connection.close()
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Connection error in get_system_responses_in_last_24_hours: {e}")
         return 0
-    finally:
-        cursor.close()
-        connection.close()
 
 def deactivate_conversation_history(userId):
-    connection = get_connection()
-    cursor = connection.cursor()
     try:
-        query = """
-        UPDATE line_bot_logs SET is_active=FALSE 
-        WHERE lineId=%s;
-        """
-        cursor.execute(query, (userId,))
-        connection.commit()
+        connection = get_connection()
+        cursor = connection.cursor()
+        try:
+            query = """
+            UPDATE line_bot_logs SET is_active=FALSE 
+            WHERE lineId=%s;
+            """
+            cursor.execute(query, (userId,))
+            connection.commit()
+        except Exception as e:
+            logger.error(f"Database error in deactivate_conversation_history: {e}")
+            connection.rollback()
+        finally:
+            cursor.close()
+            connection.close()
     except Exception as e:
-        print(f"Error: {e}")
-        connection.rollback()
-    finally:
-        cursor.close()
-        connection.close()
+        logger.error(f"Connection error in deactivate_conversation_history: {e}")
+        # データベース接続エラーでもアプリケーションを継続
+        pass
 
 # LINEからのメッセージを処理し、必要に応じてStripeの情報も確認します。
 @handler.add(MessageEvent, message=TextMessage)
@@ -179,45 +193,52 @@ def check_subscription_status(userId):
 
 # データをdbに入れる関数
 def log_to_database(timestamp, sender, userId, stripeId, message, is_active=True, sys_prompt=''):
-    connection = get_connection()
-    cursor = connection.cursor()
     try:
-        query = """
-        INSERT INTO line_bot_logs (timestamp, sender, lineId, stripeId, message, is_active, sys_prompt) 
-        VALUES (%s, %s, %s, %s, %s, %s, %s);
-        """
-        cursor.execute(query, (timestamp, sender, userId, stripeId, message, is_active, sys_prompt))
-        connection.commit()
+        connection = get_connection()
+        cursor = connection.cursor()
+        try:
+            query = """
+            INSERT INTO line_bot_logs (timestamp, sender, lineId, stripeId, message, is_active, sys_prompt) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s);
+            """
+            cursor.execute(query, (timestamp, sender, userId, stripeId, message, is_active, sys_prompt))
+            connection.commit()
+        except Exception as e:
+            logger.error(f"Database error in log_to_database: {e}")
+            connection.rollback()
+        finally:
+            cursor.close()
+            connection.close()
     except Exception as e:
-        print(f"Error: {e}")
-        connection.rollback()
-    finally:
-        cursor.close()
-        connection.close()
+        logger.error(f"Connection error in log_to_database: {e}")
+        # データベース接続エラーでもアプリケーションを継続
+        pass
 
 # 会話履歴を参照する関数
 def get_conversation_history(userId):
-    connection = get_connection()
-    cursor = connection.cursor()
     conversations = []
-
     try:
-        query = """
-        SELECT sender, message FROM line_bot_logs 
-        WHERE lineId=%s AND is_active=TRUE 
-        ORDER BY timestamp DESC LIMIT 10;
-        """
-        cursor.execute(query, (userId,))
-        
-        results = cursor.fetchall()
-        for result in results:
-            role = 'user' if result[0] == 'user' else 'assistant'
-            conversations.append({"role": role, "content": result[1]})
+        connection = get_connection()
+        cursor = connection.cursor()
+        try:
+            query = """
+            SELECT sender, message FROM line_bot_logs 
+            WHERE lineId=%s AND is_active=TRUE 
+            ORDER BY timestamp DESC LIMIT 10;
+            """
+            cursor.execute(query, (userId,))
+            
+            results = cursor.fetchall()
+            for result in results:
+                role = 'user' if result[0] == 'user' else 'assistant'
+                conversations.append({"role": role, "content": result[1]})
+        except Exception as e:
+            logger.error(f"Database error in get_conversation_history: {e}")
+        finally:
+            cursor.close()
+            connection.close()
     except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        cursor.close()
-        connection.close()
+        logger.error(f"Connection error in get_conversation_history: {e}")
 
     # 最新の会話が最後に来るように反転
     return conversations[::-1]
