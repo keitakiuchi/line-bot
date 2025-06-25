@@ -92,4 +92,14 @@
 - Log performance metrics
 - Monitor error rates
 - Track API usage
-- Set up alerts for critical issues 
+- Set up alerts for critical issues
+
+## Gemini Search
+
+`gemini` is google gemini cli. You can use it for web search.
+
+Run web search via Task Tool with `gemini -p 'WebSearch: ...'`.
+
+```bash
+gemini -p "WebSearch: ..."
+``` 

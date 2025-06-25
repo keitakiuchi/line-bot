@@ -60,6 +60,15 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        
+    - name: Install Gemini CLI
+      run: |
+        npm install -g @google/gemini-cli
+        
     - name: Claude AI Analysis
       uses: anthropics-ai/claude-action@v1
       with:
@@ -70,6 +79,19 @@ jobs:
           3. Performance implications
           4. Suggestions for improvement
           5. Compliance with project coding standards
+          
+          If you need to search for current best practices or recent information, you can use:
+          gemini -p "WebSearch: [your search query]"
+          
+          ## Gemini Search
+          
+          `gemini` is google gemini cli. You can use it for web search.
+          
+          Run web search via Task Tool with `gemini -p 'WebSearch: ...'`.
+          
+          ```bash
+          gemini -p "WebSearch: ..."
+          ```
         api-key: ${{ secrets.CLAUDE_API_KEY }}
         
     - name: Comment on PR
