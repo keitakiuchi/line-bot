@@ -9,7 +9,6 @@ from linebot.exceptions import (
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage,
 )
-import requests
 import logging
 import time
 import psutil
@@ -21,6 +20,7 @@ import stripe
 import psycopg2
 import datetime
 from psycopg2.pool import SimpleConnectionPool
+from openai import OpenAI
 
 app = Flask(__name__)
 
@@ -30,8 +30,8 @@ YOUR_CHANNEL_SECRET = os.environ["YOUR_CHANNEL_SECRET"]
 line_bot_api = LineBotApi(YOUR_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(YOUR_CHANNEL_SECRET)
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-GPT4_API_URL = 'https://api.openai.com/v1/chat/completions'
+# OpenAIクライアントの初期化
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["SUBSCRIPTION_PRICE_ID"]
@@ -111,38 +111,39 @@ def callback():
         abort(400)
     return 'OK'
 
-sys_prompt = "You will be playing the role of a supportive, Japanese-speaking counselor. Here is the conversation history so far:\n\n<conversation_history>\n{{CONVERSATION_HISTORY}}\n</conversation_history>\n\nThe user has just said:\n<user_statement>\n{{QUESTION}}\n</user_statement>\n\nPlease carefully review the conversation history and the user's latest statement. Your goal is to provide supportive counseling while following this specific method:\n\n1. Listen-Back 1: After the user makes a statement, paraphrase it into a single sentence while adding a new nuance or interpretation. \n2. Wait for the user's reply to your Listen-Back 1.\n3. Listen-Back 2: After receiving the user's response, further paraphrase their reply, condensing it into one sentence and adding another layer of meaning or interpretation.\n4. Once you've done Listen-Back 1 and Listen-Back 2 and received a response from the user, you may then pose a question from the list below, in the specified order. Do not ask a question out of order.\n5. After the user answers your question, return to Listen-Back 1 - paraphrase their answer in one sentence and introduce a new nuance or interpretation. \n6. You can ask your next question only after receiving a response to your Listen-Back 1, providing your Listen-Back 2, and getting another response from the user.\n\nIn essence, never ask consecutive questions. Always follow the pattern of Listen-Back 1, user response, Listen-Back 2, another user response before moving on to the next question.\n\nHere is the order in which you should ask questions:\n1. Start by asking the user about something they find particularly troubling.\n2. Then, inquire about how they'd envision the ideal outcome. \n3. Proceed by asking about what little they've already done.\n4. Follow up by exploring other actions they're currently undertaking.\n5. Delve into potential resources that could aid in achieving their goals.\n6. Discuss the immediate actions they can take to move closer to their aspirations.\n7. Lastly, encourage them to complete the very first step in that direction with some positive feedback, and ask if you can close the conversation.\n\n<example>\nUser: I'm so busy I don't even have time to sleep.\nYou: You are having trouble getting enough sleep.\nUser: Yes.\nYou: You are so busy that you want to manage to get some sleep.\nUser: Yes.\nYou: In what way do you have problems when you get less sleep?\n</example>\n\n<example>  \nUser: I get sick when I get less sleep.\nYou: You are worried about getting sick.\nUser: Yes.\nYou: You feel that sleep time is important to stay healthy.\nUser: That is right.\nYou: What do you hope to become?\n</example>\n\n<example>\nUser: I want to be free from suffering. But I cannot relinquish responsibility.\nYou: You want to be free from suffering, but at the same time you can't give up your responsibility.\nUser: Exactly.\nYou: You are searching for your own way forward.\nUser: Maybe so.\nYou: When do you think you are getting closer to the path you should be on, even if only a little?  \n</example>\n\nPlease follow the above procedures strictly for the consultation."
+sys_prompt = "You are a supportive Japanese counselor using the Listen-Back method. Follow this pattern: 1) Listen-Back 1: Paraphrase user's statement with new nuance, 2) Wait for response, 3) Listen-Back 2: Further paraphrase with additional meaning, 4) Ask structured questions in order. Never ask consecutive questions. Question order: 1) What troubles you most? 2) Ideal outcome? 3) What have you done? 4) Current actions? 5) Available resources? 6) Immediate steps? 7) First step with encouragement. Always respond in Japanese with empathy."
 
 def generate_gpt4_response(prompt, userId):
-    """OpenAI APIを使用してGPT-4応答を生成（タイムアウト設定付き）"""
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {OPENAI_API_KEY}'
-    }
-    
-    # 過去の会話履歴を取得（最新5件に制限）
-    conversation_history = get_conversation_history(userId)
-    conversation_history.insert(0, {"role": "system", "content": sys_prompt})
-    conversation_history.append({"role": "user", "content": prompt})
-
-    data = {
-        'model': "gpt-4o",
-        'messages': conversation_history,
-        'temperature': 1,
-        'max_tokens': 500  # トークン数を制限
-    }
-
+    """OpenAI APIを使用してGPT-4応答を生成（最新ライブラリ使用）"""
     try:
-        # タイムアウトを25秒に設定（Herokuの30秒制限より短く）
-        response = requests.post(GPT4_API_URL, headers=headers, json=data, timeout=25)
-        response.raise_for_status()
-        response_json = response.json()
-        return response_json['choices'][0]['message']['content'].strip()
-    except requests.Timeout:
-        logger.error("OpenAI API timeout")
-        return "申し訳ございません。応答に時間がかかっています。しばらくしてから再度お試しください。"
-    except requests.RequestException as e:
-        logger.error(f"OpenAI API request failed: {e}")
+        # 過去の会話履歴を取得（最新5件に制限）
+        conversation_history = get_conversation_history(userId)
+        
+        # メッセージリストを構築
+        messages = [
+            {"role": "system", "content": sys_prompt}
+        ]
+        
+        # 会話履歴を追加
+        for msg in conversation_history:
+            messages.append(msg)
+        
+        # ユーザーの最新メッセージを追加
+        messages.append({"role": "user", "content": prompt})
+
+        # OpenAI APIを呼び出し（タイムアウト設定付き）
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",  # より軽量で高速なモデル
+            messages=messages,
+            temperature=1.0,
+            max_tokens=300,  # さらに短縮
+            timeout=20.0  # タイムアウトを短縮
+        )
+        
+        return response.choices[0].message.content.strip()
+        
+    except Exception as e:
+        logger.error(f"OpenAI API error: {e}")
         return "申し訳ございません。一時的なエラーが発生しました。"
 
 @lru_cache(maxsize=1000)
@@ -195,7 +196,7 @@ def handle_line_message(event):
             current_timestamp = datetime.datetime.now()
 
             if userId:
-                # Stripe情報を非同期で取得（タイムアウト設定付き）
+                # Stripe情報を取得
                 subscription_details = get_subscription_details_for_user(userId, STRIPE_PRICE_ID)
                 stripe_id = subscription_details['stripeId'] if subscription_details else None
                 subscription_status = subscription_details['status'] if subscription_details else None
