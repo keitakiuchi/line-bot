@@ -15,13 +15,12 @@ import psutil
 from functools import lru_cache
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
-import threading
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 import stripe
-import psycopg2
 import datetime
 from psycopg2.pool import SimpleConnectionPool
+import psycopg2
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -199,7 +198,7 @@ def deactivate_conversation_history(userId):
         finally:
             cursor.close()
 
-def process_and_push_message(event):
+def process_message_async(event):
     """バックグラウンドでメッセージを処理してプッシュ送信"""
     start_time = time.time()
     userId = getattr(event.source, 'user_id', None)
@@ -228,10 +227,8 @@ def process_and_push_message(event):
                     pass
 
                 # 非同期でユーザーメッセージをログに保存
-                try:
-                    log_to_database(current_timestamp, 'user', userId, stripe_id, event.message.text, True, "")
-                except:
-                    pass
+                # 非同期でユーザーメッセージをログに保存
+                log_to_database_async(current_timestamp, 'user', userId, stripe_id, event.message.text, True)
 
                 if subscription_status == "active":
                     reply_text = generate_gpt4_response(event.message.text, userId)
@@ -248,10 +245,7 @@ def process_and_push_message(event):
                 reply_text = "エラーが発生しました。"
 
             # 非同期でシステム応答をログに保存
-            try:
-                log_to_database(current_timestamp, 'system', userId, stripe_id, reply_text, True, "")
-            except:
-                pass
+            log_to_database_async(current_timestamp, 'system', userId, stripe_id, reply_text, True)
 
         # 処理時間をログに記録
         processing_time = time.time() - start_time
@@ -259,37 +253,36 @@ def process_and_push_message(event):
             logger.warning(f"Slow processing: {processing_time:.2f}s for user {userId}")
 
         # プッシュメッセージで最終回答を送信
-        line_bot_api.push_message(userId, TextSendMessage(text=reply_text))
+        if userId:
+            line_bot_api.push_message(userId, TextSendMessage(text=reply_text))
         
     except Exception as e:
-        logger.error(f"Error in process_and_push_message: {e}")
+        logger.error(f"Error in process_message_async: {e}")
         # エラー時のフォールバック応答
         try:
-            line_bot_api.push_message(userId, TextSendMessage(text="申し訳ございません。一時的なエラーが発生しました。"))
+            if userId:
+                line_bot_api.push_message(userId, TextSendMessage(text="申し訳ございません。一時的なエラーが発生しました。"))
         except:
             pass
 
-# LINEからのメッセージを処理（非同期化）
+# LINEからのメッセージを処理（完全非同期化）
 @handler.add(MessageEvent, message=TextMessage)
 def handle_line_message(event):
-    userId = getattr(event.source, 'user_id', None)
-
+    """メッセージハンドリング - 即座に応答して処理を非同期化"""
     try:
-        # 1) すぐに仮返信（即座に200 OKを返すため）
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="回答を生成中です…"))
+        # 即座に応答（タイムアウト回避）
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="処理中です...しばらくお待ちください"))
         
-        # 2) 裏で重い処理を実行（非同期）
-        executor.submit(process_and_push_message, event)
+        # 重い処理を非同期で実行
+        executor.submit(process_message_async, event)
         
     except Exception as e:
         logger.error(f"Error in handle_line_message: {e}")
-        # エラー時のフォールバック応答
         try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="申し訳ございません。一時的なエラーが発生しました。"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="エラーが発生しました"))
         except:
             pass
 
-@lru_cache(maxsize=100)
 def get_subscription_details_for_user(userId, STRIPE_PRICE_ID):
     """Stripeサブスクリプション情報を取得（キャッシュ付き）"""
     try:
@@ -310,16 +303,23 @@ def get_subscription_details_for_user(userId, STRIPE_PRICE_ID):
         logger.error(f"Stripe API error: {e}")
         return None
 
-def log_to_database(timestamp, sender, userId, stripeId, message, is_active=True, sys_prompt=''):
+def log_to_database_async(timestamp, sender, userId, stripeId, message, is_active=True):
+    """非同期でデータベースにログを保存"""
+    try:
+        executor.submit(_log_to_database_sync, timestamp, sender, userId, stripeId, message, is_active)
+    except:
+        pass
+
+def _log_to_database_sync(timestamp, sender, userId, stripeId, message, is_active=True):
     """データベースにログを保存"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         try:
             query = """
-            INSERT INTO line_bot_logs (timestamp, sender, lineId, stripeId, message, is_active, sys_prompt) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s);
+            INSERT INTO line_bot_logs (timestamp, sender, lineId, stripeId, message, is_active) 
+            VALUES (%s, %s, %s, %s, %s, %s);
             """
-            cursor.execute(query, (timestamp, sender, userId, stripeId, message, is_active, sys_prompt))
+            cursor.execute(query, (timestamp, sender, userId, stripeId, message, is_active))
             conn.commit()
         except Exception as e:
             logger.error(f"Database error: {e}")
